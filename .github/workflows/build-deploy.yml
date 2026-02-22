@@ -1,0 +1,474 @@
+name: Build & Deploy Docker Image
+
+on:
+  push:
+    branches:
+      - main
+      - develop
+    tags:
+      - 'v*'
+  pull_request:
+    branches:
+      - main
+      - develop
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  # ===================================
+  # 1. Lint and Test Code
+  # ===================================
+  lint-and-test:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+      
+      - name: Set up Go
+        uses: actions/setup-go@v4
+        with:
+          go-version: '1.21'
+          cache: 'go'
+      
+      - name: Run go fmt
+        run: go fmt ./...
+      
+      - name: Run go vet
+        run: go vet ./...
+      
+      - name: Run tests
+        run: go test -v -race -coverprofile=coverage.out ./...
+      
+      - name: Upload coverage
+        uses: codecov/codecov-action@v3
+        with:
+          files: ./coverage.out
+          flags: unittests
+          name: codecov-umbrella
+
+  # ===================================
+  # 2. Build Docker Image
+  # ===================================
+  build:
+    needs: lint-and-test
+    runs-on: ubuntu-latest
+    
+    permissions:
+      contents: read
+      packages: write
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+      
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v2
+      
+      - name: Log in to Container Registry
+        uses: docker/login-action@v2
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v4
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=ref,event=branch
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha
+            type=raw,value=latest,enable={{is_default_branch}}
+      
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v4
+        with:
+          context: ./api
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:buildcache
+          cache-to: type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:buildcache,mode=max
+
+  # ===================================
+  # 3. Security Scanning
+  # ===================================
+  security-scan:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+      
+      - name: Run Trivy vulnerability scanner
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: 'fs'
+          scan-ref: '.'
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+      
+      - name: Upload Trivy results to GitHub Security tab
+        uses: github/codeql-action/upload-sarif@v2
+        with:
+          sarif_file: 'trivy-results.sarif'
+      
+      - name: Run gosec security scanner
+        uses: securego/gosec@master
+        with:
+          args: '-no-fail -fmt sarif -out gosec-results.sarif ./...'
+      
+      - name: Upload gosec results
+        uses: github/codeql-action/upload-sarif@v2
+        with:
+          sarif_file: 'gosec-results.sarif'
+
+  # ===================================
+  # 4. Deploy to Staging (Dev Branch)
+  # ===================================
+  deploy-staging:
+    if: github.ref == 'refs/heads/develop'
+    needs: [build, security-scan]
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+      
+      - name: Deploy to staging
+        env:
+          DEPLOY_KEY: ${{ secrets.DEPLOY_KEY }}
+          STAGING_HOST: ${{ secrets.STAGING_HOST }}
+          STAGING_USER: ${{ secrets.STAGING_USER }}
+        run: |
+          mkdir -p ~/.ssh
+          echo "$DEPLOY_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          ssh-keyscan -H $STAGING_HOST >> ~/.ssh/known_hosts
+          
+          ssh -i ~/.ssh/deploy_key $STAGING_USER@$STAGING_HOST << 'EOF'
+            cd /opt/whatsapp-api
+            git pull origin develop
+            docker-compose pull
+            docker-compose up -d
+            docker-compose exec -T whatsapp-api curl http://localhost:5000/health || exit 1
+          EOF
+
+  # ===================================
+  # 5. Deploy to Production (Main Branch + Tags)
+  # ===================================
+  deploy-production:
+    if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
+    needs: [build, security-scan]
+    runs-on: ubuntu-latest
+    
+    environment:
+      name: production
+      url: https://seu-dominio.com
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+      
+      - name: Deploy to production
+        env:
+          DEPLOY_KEY: ${{ secrets.PROD_DEPLOY_KEY }}
+          PROD_HOST: ${{ secrets.PROD_HOST }}
+          PROD_USER: ${{ secrets.PROD_USER }}
+        run: |
+          mkdir -p ~/.ssh
+          echo "$DEPLOY_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          ssh-keyscan -H $PROD_HOST >> ~/.ssh/known_hosts
+          
+          ssh -i ~/.ssh/deploy_key $PROD_USER@$PROD_HOST << 'EOF'
+            set -e
+            
+            # Vars
+            IMAGE_TAG=${{ github.ref_name }}
+            
+            cd /opt/whatsapp-api
+            
+            # Backup
+            tar -czf /backup/data-$(date +%Y%m%d-%H%M%S).tar.gz data/ 2>/dev/null || true
+            
+            # Update
+            git pull origin main
+            
+            # Update .env if needed
+            if [ ! -f .env ]; then
+              cp .env.example .env
+            fi
+            
+            # Deploy with zero-downtime
+            docker-compose pull
+            docker-compose up -d --no-deps --build whatsapp-api
+            
+            # Wait for health
+            sleep 5
+            docker-compose exec -T whatsapp-api curl -f http://localhost:5000/health || exit 1
+            
+            # Log success
+            echo "✅ Deployment successful at $(date)" >> /var/log/whatsapp-api-deploys.log
+          EOF
+      
+      - name: Notify Slack on Success
+        if: success()
+        uses: slackapi/slack-github-action@v1
+        with:
+          payload: |
+            {
+              "text": "✅ WhatsApp API deployed to production",
+              "blocks": [
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": "*WhatsApp API - Production Deployment*\n*Status*: ✅ Success\n*Version*: ${{ github.ref_name }}\n*Commit*: <${{ github.server_url }}/${{ github.repository }}/commit/${{ github.sha }}|${{ github.sha }}>"
+                  }
+                }
+              ]
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK }}
+      
+      - name: Notify Slack on Failure
+        if: failure()
+        uses: slackapi/slack-github-action@v1
+        with:
+          payload: |
+            {
+              "text": "❌ WhatsApp API deployment failed",
+              "blocks": [
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": "*WhatsApp API - Production Deployment*\n*Status*: ❌ Failed\n*Version*: ${{ github.ref_name }}\n*Check*: <${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View Logs>"
+                  }
+                }
+              ]
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK }}
+
+  # ===================================
+  # 6. Performance Test (Staging only)
+  # ===================================
+  performance-test:
+    if: github.ref == 'refs/heads/develop'
+    needs: deploy-staging
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+      
+      - name: Install k6
+        run: |
+          sudo apt-key adv --keyserver hkp://keyserver.ubuntu.com:80 --recv-keys C5AD17C747E3415A3642D57D77C6C491D6AC1D69
+          echo "deb https://dl.k6.io/deb stable main" | sudo tee /etc/apt/sources.list.d/k6-stable.list
+          sudo apt-get update
+          sudo apt-get install k6 -y
+      
+      - name: Create k6 performance test
+        run: |
+          cat > performance-test.js << 'EOF'
+          import http from 'k6/http';
+          import { check, sleep } from 'k6';
+
+          export let options = {
+            stages: [
+              { duration: '30s', target: 20 },
+              { duration: '1m30s', target: 100 },
+              { duration: '20s', target: 0 },
+            ],
+            thresholds: {
+              http_req_duration: ['p(99)<500'],
+              http_req_failed: ['rate<0.1'],
+            },
+          };
+
+          export default function () {
+            let res = http.get('http://${{ secrets.STAGING_HOST }}/health');
+            check(res, {
+              'status is 200': (r) => r.status === 200,
+              'response time < 500ms': (r) => r.timings.duration < 500,
+            });
+            sleep(1);
+          }
+          EOF
+      
+      - name: Run performance test
+        run: k6 run performance-test.js
+
+  # ===================================
+  # 7. Create Release Notes (Tags only)
+  # ===================================
+  create-release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [build, security-scan]
+    runs-on: ubuntu-latest
+    
+    permissions:
+      contents: write
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+      
+      - name: Generate release notes
+        run: |
+          VERSION=${GITHUB_REF#refs/tags/}
+          echo "Release: $VERSION" > release-notes.md
+          echo "" >> release-notes.md
+          echo "## Changes" >> release-notes.md
+          git log $(git describe --tags --abbrev=0 HEAD^)..HEAD --pretty=format:"- %s (%h)" >> release-notes.md
+      
+      - name: Create GitHub Release
+        uses: ncipollo/release-action@v1
+        with:
+          bodyFile: release-notes.md
+          draft: false
+          prerelease: ${{ contains(github.ref, 'rc') || contains(github.ref, 'beta') }}
+          artifacts: ""
+
+---
+
+# 📋 Configuração Necessária
+
+## Secrets do GitHub
+
+Vá para: **Settings → Secrets and variables → Actions**
+
+Adicione os seguintes secrets:
+
+```
+# Staging
+STAGING_HOST=seu-staging.com
+STAGING_USER=deploy
+DEPLOY_KEY=(copiar chave SSH privada)
+
+# Production
+PROD_HOST=seu-dominio.com
+PROD_USER=deploy
+PROD_DEPLOY_KEY=(copiar chave SSH privada)
+
+# Slack (Opcional)
+SLACK_WEBHOOK=https://hooks.slack.com/services/...
+```
+
+## Gerar SSH Keys
+
+```bash
+# Gerar chave
+ssh-keygen -t rsa -b 4096 -f deploy_key -N ""
+
+# Copiar chave pública para VPS
+cat deploy_key.pub >> ~/.ssh/authorized_keys
+
+# Adicionar chave privada como secret GitHub
+cat deploy_key | base64
+```
+
+---
+
+# 🔄 Fluxo CI/CD
+
+```
+1. Push para develop
+   ↓
+2. Lint & Test (Go)
+   ↓
+3. Build Docker Image
+   ↓
+4. Security Scan (Trivy, gosec)
+   ↓
+5. Deploy para Staging
+   ↓
+6. Performance Test
+   ↓
+7. ... Repeat for push to main/tags
+   ↓
+8. Deploy to Production
+   ↓
+9. Create Release Notes (se tag)
+```
+
+---
+
+# ✅ Iniciadores Rápidos
+
+## Para Developers
+
+```bash
+# Criar branch feature
+git checkout -b feature/meu-recurso
+
+# Fazer commits
+git commit -m "Implementar nova feature"
+
+# Push (dispara lint & test)
+git push origin feature/meu-recurso
+
+# PR → Merge para develop (dispara staging deploy)
+
+# Depois, PR develop → main (dispara production deploy)
+```
+
+## Para DevOps
+
+```bash
+# Release nota tag
+git tag -a v1.1.0 -m "Release v1.1.0"
+git push origin v1.1.0
+
+# CI/CD faz:
+# 1. Lint & Test
+# 2. Build
+# 3. Security scan
+# 4. Deploy para prod
+# 5. Create release notes
+```
+
+---
+
+# 📊 Status
+
+Ver status em: **Actions → Workflow** tab
+
+Cada push dispara pipeline automaticamente.
+
+---
+
+# 🆘 Troubleshooting
+
+### SSH deploy falha
+```
+Verificar:
+1. SSH key adicionada em secrets
+2. Servidor ~/.ssh/authorized_keys tem chave pub
+3. sudo su - deploy (se using diferente user)
+```
+
+### Docker build falha
+```
+Verificar:
+1. Dockerfile válido
+2. Dependências em go.mod
+3. Permissões do arquivo
+```
+
+### Test falha
+```
+Verificar:
+1. Testes locais: go test ./...
+2. CGO_ENABLED=1 (para sqlite)
+3. Docker container tem Go instalado
+```

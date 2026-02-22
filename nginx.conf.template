@@ -1,0 +1,443 @@
+# Nginx Configuration Template
+
+Salve este arquivo em seu VPS como:
+```
+/etc/nginx/sites-available/whatsapp-api
+```
+
+Depois execute:
+```bash
+sudo ln -s /etc/nginx/sites-available/whatsapp-api /etc/nginx/sites-enabled/
+sudo nginx -t
+sudo systemctl reload nginx
+```
+
+---
+
+```nginx
+# ===================================
+# WHATSAPP API - NGINX REVERSE PROXY
+# ===================================
+
+# Rate limiting zones
+limit_req_zone $binary_remote_addr zone=api_limit:10m rate=100r/m;
+limit_req_zone $binary_remote_addr zone=general_limit:10m rate=1000r/m;
+
+# Upstream definition
+upstream whatsapp_backend {
+    least_conn;  # Load balancing strategy
+    server localhost:5000 max_fails=3 fail_timeout=30s;
+    # server localhost:5001 max_fails=3 fail_timeout=30s;  # Adicionar mais instâncias se necessário
+    keepalive 32;
+}
+
+# ===================================
+# HTTP - Redirect to HTTPS
+# ===================================
+
+server {
+    listen 80;
+    listen [::]:80;
+    server_name seu-dominio.com www.seu-dominio.com;
+
+    # ACME challenge for Let's Encrypt
+    location /.well-known/acme-challenge/ {
+        root /var/www/certbot;
+    }
+
+    # Redirect all traffic to HTTPS
+    location / {
+        return 301 https://$server_name$request_uri;
+    }
+}
+
+# ===================================
+# HTTPS - Main API Server
+# ===================================
+
+server {
+    listen 443 ssl http2;
+    listen [::]:443 ssl http2;
+    
+    server_name seu-dominio.com www.seu-dominio.com;
+
+    # ---- SSL Configuration ----
+    ssl_certificate /etc/letsencrypt/live/seu-dominio.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/seu-dominio.com/privkey.pem;
+    
+    # SSL session cache
+    ssl_session_cache shared:SSL:10m;
+    ssl_session_timeout 10m;
+    
+    # Modern SSL configuration
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_ciphers ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305:DHE-RSA-AES128-GCM-SHA256:DHE-RSA-AES256-GCM-SHA384;
+    ssl_prefer_server_ciphers off;
+    
+    # HSTS (HTTP Strict Transport Security)
+    add_header Strict-Transport-Security "max-age=63072000; includeSubDomains; preload" always;
+
+    # ---- Security Headers ----
+    add_header X-Frame-Options "SAMEORIGIN" always;
+    add_header X-Content-Type-Options "nosniff" always;
+    add_header X-XSS-Protection "1; mode=block" always;
+    add_header Referrer-Policy "no-referrer-when-downgrade" always;
+    add_header Content-Security-Policy "default-src 'self'" always;
+
+    # ---- Compression ----
+    gzip on;
+    gzip_vary on;
+    gzip_proxied any;
+    gzip_comp_level 6;
+    gzip_types text/plain text/css text/xml text/javascript application/json application/javascript application/xml+rss application/rss+xml;
+    gzip_min_length 1000;
+    gzip_disable "msie6";
+
+    # ---- Client Configuration ----
+    client_max_body_size 100M;  # Máximo para uploads de mídia
+    client_body_timeout 30s;
+    client_header_timeout 30s;
+    
+    # ---- Logging ----
+    access_log /var/log/nginx/whatsapp-api-access.log combined buffer=32k flush=5s;
+    error_log /var/log/nginx/whatsapp-api-error.log warn;
+
+    # ---- Health Check ----
+    location /health {
+        access_log off;  # Don't log health checks
+        proxy_pass http://whatsapp_backend;
+        proxy_http_version 1.1;
+        proxy_set_header Connection "";
+        proxy_connect_timeout 5s;
+        proxy_read_timeout 5s;
+    }
+
+    # ---- Proxy Configuration for API ----
+    location / {
+        # Rate limiting (1000 req/min)
+        limit_req zone=general_limit burst=50 nodelay;
+
+        proxy_pass http://whatsapp_backend;
+        
+        # HTTP version and keep-alive
+        proxy_http_version 1.1;
+        proxy_set_header Connection "";
+        
+        # Headers
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header X-Forwarded-Host $host;
+        
+        # Timeouts
+        proxy_connect_timeout 60s;
+        proxy_send_timeout 60s;
+        proxy_read_timeout 60s;
+        
+        # Buffering
+        proxy_buffering on;
+        proxy_buffer_size 4k;
+        proxy_buffers 8 4k;
+        proxy_busy_buffers_size 8k;
+        
+        # Error handling
+        proxy_next_upstream error timeout invalid_header http_500 http_502 http_503 http_504;
+        proxy_next_upstream_tries 3;
+        
+        # Websocket support (se necessário)
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+    }
+
+    # ---- API Specific Rate Limits ----
+    
+    # Send message endpoint (10 req/min)
+    location ~ ^/tenants/[^/]+/sessions/[^/]+/messages$ {
+        limit_req zone=api_limit burst=10 nodelay;
+        proxy_pass http://whatsapp_backend;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+
+    # ---- Static Files Cache ----
+    location ~* \.(jpg|jpeg|png|gif|ico|css|js|svg|woff|woff2|ttf|eot)$ {
+        expires 30d;
+        add_header Cache-Control "public, immutable";
+        access_log off;
+    }
+
+    # ---- Deny Access to Sensitive Files ----
+    location ~ /\. {
+        deny all;
+        access_log off;
+        log_not_found off;
+    }
+
+    location ~ ~$ {
+        deny all;
+        access_log off;
+        log_not_found off;
+    }
+
+    # ---- Custom Error Pages ----
+    error_page 404 /404.json;
+    error_page 500 502 503 504 /50x.json;
+
+    location = /404.json {
+        internal;
+        default_type application/json;
+        return 404 '{"error":"Not Found","timestamp":"'$(date -u +'%Y-%m-%dT%H:%M:%SZ')'"}';
+    }
+
+    location = /50x.json {
+        internal;
+        default_type application/json;
+        return 500 '{"error":"Internal Server Error","timestamp":"'$(date -u +'%Y-%m-%dT%H:%M:%SZ')'"}';
+    }
+}
+
+# ===================================
+# Optional: Metrics Server
+# ===================================
+
+server {
+    listen 8888;
+    listen [::]:8888;
+    server_name localhost;
+
+    # Permitir acesso apenas localmente
+    allow 127.0.0.1;
+    allow ::1;
+    deny all;
+
+    location /stats {
+        stub_status;
+        access_log off;
+    }
+}
+```
+
+---
+
+## 🔧 Instruções de Uso
+
+### 1. Preparar VPS
+
+```bash
+# Atualizar sistema
+sudo apt update && sudo apt upgrade -y
+
+# Instalar Nginx
+sudo apt install nginx -y
+
+# Instalar Certbot
+sudo apt install certbot python3-certbot-nginx -y
+
+# Iniciar Nginx
+sudo systemctl start nginx
+sudo systemctl enable nginx
+```
+
+### 2. Colocar Config no Nginx
+
+```bash
+# Criar arquivo
+sudo nano /etc/nginx/sites-available/whatsapp-api
+
+# Colar conteúdo do arquivo acima, ajustando:
+# - seu-dominio.com para seu domínio real
+# - localhost:5000 se sua API está em porta diferente
+
+# Testar sintaxe
+sudo nginx -t
+
+# Se OK, habilitar
+sudo ln -s /etc/nginx/sites-available/whatsapp-api /etc/nginx/sites-enabled/
+
+# Recarregar
+sudo systemctl reload nginx
+```
+
+### 3. Obter Certificado SSL
+
+```bash
+sudo certbot certonly --nginx -d seu-dominio.com -d www.seu-dominio.com
+
+# Responder às perguntas:
+# - Email para notificações
+# - Aceitar termos de serviço
+```
+
+### 4. Auto-Renew Certificado
+
+```bash
+# Verificar que auto-renew está habilitado
+sudo systemctl status certbot.timer
+
+# Testar renovação
+sudo certbot renew --dry-run
+
+# Se tudo OK, Nginx recarregará automaticamente
+```
+
+### 5. Verificar Funcionamento
+
+```bash
+# Teste local
+curl -v http://seu-dominio.com
+
+# Deve redirecionar para HTTPS
+
+curl -v https://seu-dominio.com
+
+# Deve retornar sua API
+
+# Ver logs
+sudo tail -f /var/log/nginx/whatsapp-api-access.log
+sudo tail -f /var/log/nginx/whatsapp-api-error.log
+```
+
+---
+
+## 🔒 Security Best Practices inclusos:
+
+✅ HTTPS/SSL TLS 1.2+
+✅ HSTS headers
+✅ Rate limiting
+✅ X-Frame-Options
+✅ X-Content-Type-Options
+✅ X-XSS-Protection
+✅ Content-Security-Policy
+✅ Gzip compression
+✅ Keep-alive optimization
+✅ Non-standard file blocks (hidden files, backups)
+✅ Upstream failover
+✅ Load balancing (least_conn)
+✅ Proxy buffering
+✅ Health check path
+
+---
+
+## 📊 Monitoramento
+
+Ver estatísticas localmente:
+
+```bash
+curl http://localhost:8888/stats
+```
+
+Output esperado:
+```
+Active connections: 42
+server accepts handled requests
+142857 142857 428571
+Reading: 5 Writing: 10 Waiting: 27
+```
+
+---
+
+## 🆘 Troubleshooting
+
+### Erro: "SSL certificate problem"
+→ Verificar: `sudo certbot renew --dry-run`
+→ Verificar portas: `sudo lsof -i :80,443`
+
+### Erro: "upstream timed out"
+→ Verificar se API está rodando: `docker ps`
+→ Aumentar timeouts em `proxy_*_timeout`
+
+### Erro: "Permission denied"
+→ Verificar ownership: `sudo chown www-data /etc/nginx/...`
+→ Verificar permissões: `sudo chmod 644 /etc/nginx/...`
+
+### Erro: "413 Request Entity Too Large"
+→ Aumentar `client_max_body_size` (já é 100M)
+
+### Nginx muito lento
+→ Ver logs: `sudo tail -f /var/log/nginx/*.log`
+→ Monitorar: `htop` ou `docker stats`
+→ Aumentar worker processes em `/etc/nginx/nginx.conf`
+
+---
+
+## 📈 Performance Tips
+
+1. **Cache Content**: Implementar caching em upstream
+2. **CDN**: Usar CloudFlare ou Akamai para assets
+3. **Load Balancing**: Adicionar mais upstream servers
+4. **Monitoring**: Integrar Datadog ou New Relic
+5. **Alerting**: Configurar alertas para erros 5xx
+
+---
+
+## 🔄 Auto-Renew Certificado
+
+Os certificados Let's Encrypt expiram em 90 dias.
+
+Certbot configura renewal automático:
+
+```bash
+# Verificar status
+sudo systemctl status certbot.timer
+
+# Ver se está ativo
+sudo systemctl list-timers certbot*
+
+# Forçar renovação (testar)
+sudo certbot renew --force-renewal
+
+# Após renovação bem sucedida:
+sudo systemctl reload nginx
+```
+
+O sistema deve renovar automaticamente 30 dias antes da expiração.
+
+---
+
+## 📝 Variáveis Customizáveis
+
+Edite antes de usar:
+
+```nginx
+# Seu domínio
+server_name seu-dominio.com www.seu-dominio.com;
+
+# Caminho dos certificados
+ssl_certificate /etc/letsencrypt/live/seu-dominio.com/fullchain.pem;
+ssl_certificate_key /etc/letsencrypt/live/seu-dominio.com/privkey.pem;
+
+# Backend (se mudar a porta da API)
+upstream whatsapp_backend {
+    server localhost:5000;  # ← Mudar aqui
+}
+
+# Rate limits (ajustar conforme necessário)
+limit_req_zone ... rate=100r/m;  # APIs (10 req/min)
+limit_req_zone ... rate=1000r/m;  # Geral (geral)
+
+# Max body size para uploads
+client_max_body_size 100M;  # ← Aumentar se necessário
+```
+
+---
+
+## ✅ Checklist Final
+
+- [ ] Arquivo nginx criado
+- [ ] Sintaxe testada (`nginx -t`)
+- [ ] Site habilitado (symlink criado)
+- [ ] Certificado obtido (certbot)
+- [ ] HTTPS
+
+ funcionando
+- [ ] Rate limiting testado
+- [ ] Logs configurados
+- [ ] Certificado auto-renew verificado
+- [ ] Firewall permite portas 80 e 443
+- [ ] Domínio DNS aponta para VPS
+
+Pronto para produção! 🚀
