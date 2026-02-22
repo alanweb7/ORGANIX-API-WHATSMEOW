@@ -2,12 +2,9 @@
 FROM golang:1.21-alpine AS builder
 
 # Instalar dependências de build
-RUN apk add --no-cache gcc musl-dev sqlite-dev git
+RUN apk add --no-cache gcc musl-dev sqlite-dev
 
 WORKDIR /build
-
-# Copiar módulo local (substituição)
-COPY whatsmeow/ /build/whatsmeow/
 
 # Copiar go.mod e go.sum
 COPY api/go.mod api/go.sum ./
