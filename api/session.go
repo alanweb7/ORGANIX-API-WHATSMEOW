@@ -123,7 +123,9 @@ func (sm *SessionManager) CreateSession(tenantID, userID string) (*Session, erro
 	// Preparar cliente WhatsApp
 	tenantDir := filepath.Join(sm.dbPath, tenantID)
 	ctx := context.Background()
-	container, err := sqlstore.New(ctx, "sqlite3", filepath.Join(tenantDir, "wa-"+userID+".db"), waLog.Noop)
+	// Use URI mode and enable foreign keys for SQLite
+	dbPath := fmt.Sprintf("file:%s?_foreign_keys=on", filepath.Join(tenantDir, "wa-"+userID+".db"))
+	container, err := sqlstore.New(ctx, "sqlite3", dbPath, waLog.Noop)
 	if err != nil {
 		return nil, err
 	}
